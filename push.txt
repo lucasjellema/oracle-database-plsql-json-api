@@ -1,0 +1,265 @@
+Fake push - based on polling
+
+create sequence psh_seq;
+
+
+create table events_to_push
+( event_type varchar2(30)
+, event_timestamp timestamp default systimestamp
+, event_version number(10) default psh_seq.nextval 
+, payload varchar2(1000)
+);
+
+create or replace 
+type  event_to_push_t force as object 
+( event_type varchar2(30)
+, event_timestamp timestamp 
+, event_version number(10) 
+, payload varchar2(1000)
+, constructor function event_to_push_t
+              ( event_type in varchar2
+              , payload  in varchar2
+              ) return self as result
+, constructor function event_to_push_t
+              ( event_type in varchar2
+              , event_timestamp in timestamp 
+              , event_version in number
+              , payload  in varchar2
+              ) return self as result
+, member function to_json
+  return varchar2		  
+) NOT FINAL
+;
+/
+
+create or replace 
+type body event_to_push_t as
+constructor function event_to_push_t
+              ( event_type in varchar2
+              , payload  in varchar2
+              ) return self as result is
+begin
+  self.event_type:= event_type;
+  self.payload:= payload;
+  self.event_version:= psh_seq.nextval;
+  self.event_timestamp:= systimestamp;
+  return;
+end;
+
+constructor function event_to_push_t
+              ( event_type in varchar2
+              , event_timestamp in timestamp 
+              , event_version in number
+              , payload  in varchar2
+              ) return self as result is
+begin
+  self.event_type:= event_type;
+  self.payload:= payload;
+  self.event_version:= event_version;
+  self.event_timestamp:= event_timestamp;
+  return;
+end;
+
+
+member function to_json
+return varchar2
+is
+  l_json    varchar2(32600);
+begin
+  l_json:= '{'
+            ||'"eventType" : "'||self.event_type||'" '
+            ||', "eventVersion" : '||self.event_version||' '
+            ||', "payload" : "'||replace(self.payload,'"','quot')||'" ' -- replace " with quot to prevent parsing errors on payload
+            ||', "eventTimestamp" : "'||to_char(self.event_timestamp,'YYYY-MM-DD HH24:MI:SS')||'" '
+            ||'}';
+  return l_json;         
+end to_json;
+
+end;
+/
+
+
+
+
+create or replace 
+package event_push_manager
+as
+
+procedure push_event
+( p_event event_to_push_t
+);
+
+function fetch_recent_events
+( p_version_threshold in number default null  -- only events with a version number higher than p_version_threshold are to be returned
+)  return varchar2 -- return a JSON array with events:  [ {"eventType":"vote", "eventVersion": 321, "payload": "{'employeeId': 7782, 'numberOfVotes':32}"},{"eventType":"vote", "eventVersion": 322, "payload": "{'employeeId': 7781, 'numberOfVotes':1}"} ]
+;
+
+end event_push_manager;
+/
+
+
+create or replace 
+package body event_push_manager
+as
+
+procedure push_event
+( p_event event_to_push_t
+) is
+begin
+  insert into events_to_push
+( event_type 
+, event_timestamp 
+, event_version  
+, payload 
+) values
+(p_event.event_type 
+, p_event.event_timestamp 
+, p_event.event_version  
+, p_event.payload);
+end push_event; 
+
+function fetch_recent_events
+( p_version_threshold in number default null  -- only events with a version number higher than p_version_threshold are to be returned
+)  return varchar2 -- return a JSON array with events:  [ {"eventType":"vote", "eventVersion": 321, "payload": "{'employeeId': 7782, 'numberOfVotes':32}"},{"eventType":"vote", "eventVersion": 322, "payload": "{'employeeId': 7781, 'numberOfVotes':1}"} ]
+is
+l_json    varchar2(32600);
+begin
+  for r in ( select *
+             from (select  event_to_push_t(event_type, event_timestamp, event_version , payload ) event, rownum rn 
+                   from    events_to_push where event_version> nvl(p_version_threshold,-1) 
+                   order 
+                   by event_version desc
+                  )
+             where rn < 30  -- only first 30 events      
+            )
+  loop
+    l_json:= l_json|| ',' ||r.event.to_json;
+  end loop;
+  l_json:= '['||ltrim(l_json,',')||']';
+  return l_json;
+
+end fetch_recent_events;
+
+end event_push_manager;
+/
+
+
+-- this trigger causes a vote event to be published whenever a record is  created in table presidential_election
+
+create or replace 
+trigger pen_ari_trg
+after insert
+on presidential_election
+for each row
+declare
+  l_count number(10,0):=-1;
+begin
+  /* not allowed because of ORA-04091: table HR.PRESIDENTIAL_ELECTION is mutating, 
+  select count(*)
+  into   l_count
+  from   presidential_election as of scn dbms_flashback.get_system_change_number
+  where  empno = :new.empno
+  ;
+  */
+  l_count:= employee_api.get_vote_count_for_employee(p_id => :new.empno)+1;
+  event_push_manager.push_event
+  ( p_event => event_to_push_t('vote', '{"employeeId": '||:new.empno||', "numberOfVotes":'||l_count||'}')
+  );
+end;  
+/
+
+-- to push an event:
+
+begin  
+  event_push_manager.push_event
+  ( p_event => event_to_push_t('vote', '{"employeeId": 7782, "numberOfVotes":11}')
+  );
+end;    
+
+
+select event_push_manager.fetch_recent_events
+from   dual
+
+
+
+select event_push_manager.fetch_recent_events(p_version_threshold => 2)
+from   dual
+
+Real Push - based UTL_HTTP:
+
+
+execute as SYS:
+
+grant execute on utl_http to hr
+/
+
+grant execute on dbms_lock to hr
+/
+
+BEGIN
+  DBMS_NETWORK_ACL_ADMIN.create_acl (
+    acl          => 'employeedatapi_acl_file.xml', 
+    description  => 'Granting HR access to connect to external hosts',
+    principal    => 'HR',
+    is_grant     => TRUE, 
+    privilege    => 'connect',
+    start_date   => SYSTIMESTAMP,
+    end_date     => NULL);
+end;
+ 
+begin
+  DBMS_NETWORK_ACL_ADMIN.assign_acl (
+    acl         => 'employeedatapi_acl_file.xml',
+    host        => 'data-api-lucasjellema.apaas.em2.oraclecloud.com', 
+    lower_port  => null,
+    upper_port  => NULL);    
+end; 
+
+Note:
+
+in order to UTL_HTTP to an HTTPS endpoint (over SSL) requires uploading Certificates to Oracle Wallet and configuring UTL_HTTP for that wallet:
+https://oracle-base.com/articles/misc/utl_http-and-ssl#get-site-certificates 
+
+
+as HR:
+
+
+
+
+SELECT utl_http.request('https://data-api-lucasjellema.apaas.em2.oraclecloud.com/employee-api/employees/7782') FROM dual;
+
+example code for making HTTP POST calls with JSON payload
+
+create or replace
+procedure publish_cinema_event
+( p_room_id in varchar2
+, p_party_size in number
+) is
+  req utl_http.req;
+  res utl_http.resp;
+  url varchar2(4000) := 'http://localhost:9002/cinema';
+  name varchar2(4000);
+  buffer varchar2(4000); 
+  content varchar2(4000) := '{"room":"'||p_room_id||'", "partySize":"'||p_party_Size||'"}';
+ 
+begin
+  req := utl_http.begin_request(url, 'POST',' HTTP/1.1');
+  utl_http.set_header(req, 'user-agent', 'mozilla/4.0'); 
+  utl_http.set_header(req, 'content-type', 'application/json'); 
+  utl_http.set_header(req, 'Content-Length', length(content));
+ 
+  utl_http.write_text(req, content);
+  res := utl_http.get_response(req);
+  -- process the response from the HTTP call
+  begin
+    loop
+      utl_http.read_line(res, buffer);
+      dbms_output.put_line(buffer);
+    end loop;
+    utl_http.end_response(res);
+  exception
+    when utl_http.end_of_body 
+    then
+      utl_http.end_response(res);
+  end;
+end publish_cinema_event;
